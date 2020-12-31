@@ -11,4 +11,7 @@ path = "main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-loom = "0.3"
+loom = { version = "0.4", optional = true, features = [ "checkpoint" ] }
+
+[profile.release]
+debug = true

@@ -1,73 +1,157 @@
+use super::*;
+
 use std::mem::MaybeUninit;
-
 use loom::cell::UnsafeCell;
-use loom::sync::{atomic, Mutex};
+use loom::sync::{atomic, Arc};
 
-const LENGTH: u32 = 8;
-const MASK: u32 = LENGTH - 1;
 
-pub struct Ring<T> {
+struct Ring<T> {
     buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    flags: Box<[atomic::AtomicU64]>,
     head: atomic::AtomicU32,
     tail: atomic::AtomicU32,
-    push_lock: Mutex<()>,
+    epoch: atomic::AtomicU64
 }
 
-impl<T: Copy> Ring<T> {
-    pub fn new() -> Ring<T> {
-        let mut buf = Vec::with_capacity(LENGTH as usize);
+unsafe impl<T: Send> Send for Ring<T> {}
+unsafe impl<T: Sync> Sync for Ring<T> {}
 
-        for _ in 0..LENGTH {
-            buf.push(UnsafeCell::new(MaybeUninit::uninit()));
-        }
+#[derive(Clone)]
+pub struct Producer<T>(Arc<Ring<T>>);
+pub struct Consumer<T>(Arc<Ring<T>>);
 
-        Ring {
-            buf: buf.into_boxed_slice(),
-            head: atomic::AtomicU32::new(0),
-            tail: atomic::AtomicU32::new(0),
-            push_lock: Mutex::new(()),
-        }
+pub fn new<T: Copy>(size: usize) -> (Producer<T>, Consumer<T>) {
+    assert!(size.is_power_of_two());
+
+    let mut buf = Vec::with_capacity(size);
+    let mut buf2 = Vec::with_capacity(size);
+
+    for _ in 0..size {
+        buf.push(UnsafeCell::new(MaybeUninit::uninit()));
+        buf2.push(atomic::AtomicU64::new(0));
     }
 
-    pub fn push(&self, t: T) -> Result<(), T> {
-        let _lock = self.push_lock.lock().unwrap();
-        let head = self.head.load(atomic::Ordering::Acquire);
-        let tail = unsafe { self.tail.unsync_load() };
+    let ring = Arc::new(Ring {
+        buf: buf.into_boxed_slice(),
+        flags: buf2.into_boxed_slice(),
+        head: atomic::AtomicU32::new(0),
+        tail: atomic::AtomicU32::new(0),
+        epoch: atomic::AtomicU64::new(0)
+    });
 
-        if tail.wrapping_sub(head) == LENGTH {
-            return Err(t);
+    let producer = Producer(ring.clone());
+    let consumer = Consumer(ring);
+
+    (producer, consumer)
+}
+
+impl<T: Copy> Producer<T> {
+    pub fn push(&self, t: T) -> Result<(), T> {
+        let mask = (self.0.buf.len() - 1) as u32;
+        let mut head = self.0.head.load(atomic::Ordering::Acquire);
+        let mut tail = self.0.tail.load(atomic::Ordering::Acquire);
+        let mut epoch = self.0.epoch.load(atomic::Ordering::Acquire);
+        let mut is_flags_failed = false;
+        let mut next_epoch_ready = true;
+
+        loop {
+            if tail.wrapping_sub(head) == self.0.buf.len() as u32 {
+                tail = self.0.tail.load(atomic::Ordering::Acquire);
+
+                if head == tail {
+                    if is_flags_failed && next_epoch_ready {
+                        epoch = self.0.epoch.compare_exchange(
+                            epoch,
+                            epoch.wrapping_add(2),
+                            atomic::Ordering::AcqRel,
+                            atomic::Ordering::Acquire
+                        )
+                            .map(|epoch| epoch.wrapping_add(2))
+                            .unwrap_or_else(|epoch| epoch);
+                    } else {
+                        epoch = self.0.epoch.load(atomic::Ordering::Acquire);
+                    }
+
+                    head = self.0.head.load(atomic::Ordering::Acquire);
+                    is_flags_failed = false;
+                    next_epoch_ready = true;
+
+                    thread::yield_now();
+                    continue
+                }
+
+                return Err(t);
+            }
+
+            match self.0.flags[(tail & mask) as usize]
+                .compare_exchange(
+                    epoch,
+                    epoch.wrapping_add(1),
+                    atomic::Ordering::AcqRel,
+                    atomic::Ordering::Acquire
+                )
+            {
+                Ok(_) => break,
+                Err(epoch) => {
+                    is_flags_failed = true;
+                    next_epoch_ready &= epoch & 1 == 0;
+                }
+            }
+
+            tail = tail.wrapping_add(1);
+
+            thread::yield_now();
         }
+
+        dbg!(head, tail, epoch);
 
         unsafe {
-            self.buf[(tail & MASK) as usize].with_mut(|p| (*p).as_mut_ptr().write(t));
+            self.0.buf[(tail & mask) as usize]
+                .with_mut(|p| (*p).as_mut_ptr().write(t));
         }
 
-        self.tail
-            .store(tail.wrapping_add(1), atomic::Ordering::Release);
+        while self.0.tail.compare_exchange_weak(
+            tail,
+            tail.wrapping_add(1),
+            atomic::Ordering::Release,
+            atomic::Ordering::Relaxed
+        ).is_err() {
+            thread::yield_now();
+        }
+
+        self.0.flags[(tail & mask) as usize]
+            .fetch_add(1, atomic::Ordering::Release);
 
         Ok(())
     }
+}
 
-    pub fn pop(&self) -> Option<T> {
-        loop {
-            let head = self.head.load(atomic::Ordering::Acquire);
-            let tail = self.tail.load(atomic::Ordering::Acquire);
+impl<T: Copy> Consumer<T> {
+    pub fn pop(&mut self) -> Option<T> {
+        let mask = (self.0.buf.len() - 1) as u32;
+        let head = unsafe { load_u32(&self.0.head) };
+        let tail = self.0.tail.load(atomic::Ordering::Acquire);
 
-            if head == tail {
-                return None;
-            }
-
-            let t = self.buf[(head & MASK) as usize].with(|p| unsafe { (*p).as_ptr().read() });
-
-            match self.head.compare_exchange_weak(
-                head,
-                head.wrapping_add(1),
-                atomic::Ordering::Release,
-                atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(t),
-                Err(_) => (),
-            }
+        if head == tail {
+            return None;
         }
+
+        dbg!(head, tail);
+
+        let t = self.0.buf[(head & mask) as usize].with(|p| unsafe { p.read().assume_init() });
+
+        self.0.head.store(head.wrapping_add(1), atomic::Ordering::Release);
+
+        Some(t)
+    }
+}
+
+unsafe fn load_u32(t: &atomic::AtomicU32) -> u32 {
+    #[cfg(feature = "loom")] {
+        t.unsync_load()
+    }
+
+    #[cfg(not(feature = "loom"))] {
+        (t as *const atomic::AtomicU32).read().into_inner()
     }
 }
