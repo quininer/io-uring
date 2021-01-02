@@ -28,21 +28,32 @@ mod loom {
             }
         }
     }
-
-    pub fn model<F>(f: F)
-    where
-        F: Fn() + Sync + Send + 'static
-    {
-        f()
-    }
 }
 
 mod ring;
 
 use loom::thread;
 
+#[cfg(feature = "loom")]
+fn model<F>(f: F)
+where
+    F: Fn() + Sync + Send + 'static,
+{
+    let mut builder = loom::model::Builder::new();
+    builder.max_branches = 1500;
+    builder.check(f);
+}
+
+#[cfg(not(feature = "loom"))]
+fn model<F>(f: F)
+where
+    F: Fn() + Sync + Send + 'static
+{
+    f()
+}
+
 fn mpsc(size: usize, thread: usize, count: usize) {
-    loom::model(move || {
+    model(move || {
         let (producer, mut consumer) = ring::new::<u32>(size);
 
         let mut joins = Vec::new();
@@ -58,8 +69,8 @@ fn mpsc(size: usize, thread: usize, count: usize) {
                     thread::yield_now();
                 }
 
-                #[cfg(not(feature = "loom"))]
-                println!("{} end", x);
+//                #[cfg(not(feature = "loom"))]
+                // println!("{} end", x);
             });
             joins.push(j);
         }
@@ -72,6 +83,8 @@ fn mpsc(size: usize, thread: usize, count: usize) {
 
             thread::yield_now();
         }
+
+        // println!("pop end");
 
         for j in joins {
             j.join().unwrap();

@@ -51,14 +51,24 @@ impl<T: Copy> Producer<T> {
         let mut head = self.0.head.load(atomic::Ordering::Acquire);
         let mut tail = self.0.tail.load(atomic::Ordering::Acquire);
         let mut epoch = self.0.epoch.load(atomic::Ordering::Acquire);
+        let mut tail2 = tail;
         let mut is_flags_failed = false;
         let mut next_epoch_ready = true;
 
         loop {
-            if tail.wrapping_sub(head) == self.0.buf.len() as u32 {
-                tail = self.0.tail.load(atomic::Ordering::Acquire);
+            assert!(tail.wrapping_sub(head) <= self.0.buf.len() as u32,
+                "{} {} {} {}",
+                head,
+                tail,
+                tail2,
+                epoch
+            );
 
-                if head == tail {
+            if tail.wrapping_sub(head) == self.0.buf.len() as u32 {
+                if head == tail2 {
+                    head = self.0.head.load(atomic::Ordering::Acquire);
+                    tail = self.0.tail.load(atomic::Ordering::Acquire);
+
                     if is_flags_failed && next_epoch_ready {
                         epoch = self.0.epoch.compare_exchange(
                             epoch,
@@ -72,7 +82,7 @@ impl<T: Copy> Producer<T> {
                         epoch = self.0.epoch.load(atomic::Ordering::Acquire);
                     }
 
-                    head = self.0.head.load(atomic::Ordering::Acquire);
+                    tail2 = tail;
                     is_flags_failed = false;
                     next_epoch_ready = true;
 
@@ -103,10 +113,10 @@ impl<T: Copy> Producer<T> {
             thread::yield_now();
         }
 
-        dbg!(head, tail, epoch);
+        let index = (tail & mask) as usize;
 
         unsafe {
-            self.0.buf[(tail & mask) as usize]
+            self.0.buf[index]
                 .with_mut(|p| (*p).as_mut_ptr().write(t));
         }
 
@@ -119,7 +129,7 @@ impl<T: Copy> Producer<T> {
             thread::yield_now();
         }
 
-        self.0.flags[(tail & mask) as usize]
+        self.0.flags[index]
             .fetch_add(1, atomic::Ordering::Release);
 
         Ok(())
@@ -132,11 +142,11 @@ impl<T: Copy> Consumer<T> {
         let head = unsafe { load_u32(&self.0.head) };
         let tail = self.0.tail.load(atomic::Ordering::Acquire);
 
+        // dbg!(head, tail);
+
         if head == tail {
             return None;
         }
-
-        dbg!(head, tail);
 
         let t = self.0.buf[(head & mask) as usize].with(|p| unsafe { p.read().assume_init() });
 
