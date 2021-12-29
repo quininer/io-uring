@@ -92,101 +92,177 @@ macro_rules! opcode {
     }
 }
 
+
+macro_rules! opcode2 {
+    (@type impl sealed::UseFixed ) => {
+        sealed::Target
+    };
+    (@type impl sealed::UseFd ) => {
+        RawFd
+    };
+    (@type $name:ty ) => {
+        $name
+    };
+    (
+        $( #[$outer:meta] )*
+        pub struct $name:ident {
+            $( #[$new_meta:meta] )*
+
+            $(
+                $field:ident : { $( $tnt:tt )+ }
+                => ( $sqe:ident ) $sqe_block:block
+            ),*
+
+            $(,)?
+
+            ;;
+
+            $(
+                $( #[$opt_meta:meta] )*
+                $opt_field:ident : $opt_tname:ty = $default:expr
+                => ( $opt_sqe:ident ) $opt_block:block
+            ),*
+
+            $(,)?
+        }
+
+        pub const CODE = $opcode:expr;
+    ) => {
+        $( #[$outer] )*
+        pub struct $name(sys::io_uring_sqe);
+
+        impl $name {
+            /// The opcode of the operation. This can be passed to
+            /// [`Probe::is_supported`](crate::Probe::is_supported) to check if this operation is
+            /// supported with the current kernel.
+            pub const CODE: u8 = $opcode as _;
+
+            $( #[$new_meta] )*
+            #[inline]
+            pub fn new($( $field : $( $tnt )* ),*) -> Self {
+                let mut opcode = $name(sqe_zeroed());
+                opcode.init( $( $field ,)* );
+                opcode
+            }
+
+            $( #[$new_meta] )*
+            #[inline]
+            pub fn init(&mut self, $( $field : $( $tnt )* ),*) {
+                self.0.opcode = $opcode as _;
+
+                $(
+                    let $sqe = &mut self.0;
+                    $sqe_block;
+                )*
+
+                $(
+                    let $opt_sqe = &mut self.0;
+                    let $opt_field = $default;
+                    $opt_block;
+                )*
+            }
+
+            $(
+                $( #[$opt_meta] )*
+                #[inline]
+                pub fn $opt_field(mut self, $opt_field: $opt_tname) -> Self {
+                    let $opt_sqe = &mut self.0;
+                    $opt_block;
+                    self
+                }
+            )*
+
+            #[inline]
+            pub fn build(self) -> Entry {
+                Entry(self.0)
+            }
+        }
+    }
+}
+
 /// inline zeroed to improve codegen
 #[inline(always)]
 fn sqe_zeroed() -> sys::io_uring_sqe {
     unsafe { std::mem::zeroed() }
 }
 
-opcode!(
+opcode2!(
     /// Do not perform any I/O.
     ///
     /// This is useful for testing the performance of the io_uring implementation itself.
-    #[derive(Debug)]
     pub struct Nop { ;; }
 
     pub const CODE = sys::IORING_OP_NOP;
-
-    pub fn build(self) -> Entry {
-        let Nop {} = self;
-
-        let mut sqe = sqe_zeroed();
-        sqe.opcode = Self::CODE;
-        sqe.fd = -1;
-        Entry(sqe)
-    }
 );
 
-opcode!(
+opcode2!(
     /// Vectored read, equivalent to `preadv2(2)`.
-    #[derive(Debug)]
     pub struct Readv {
-        fd: { impl sealed::UseFixed },
-        iovec: { *const libc::iovec },
-        len: { u32 },
+        fd: { impl sealed::UseFixed }
+            => (sqe) {
+                assign_fd!(sqe.fd = fd.into());
+            },
+        iovec: { *const libc::iovec }
+            => (sqe) {
+                sqe.__bindgen_anon_2.addr = iovec as _;
+            },
+        len: { u32 }
+            => (sqe) {
+                sqe.len = len;
+            },
         ;;
-        ioprio: u16 = 0,
-        offset: libc::off_t = 0,
+        ioprio: u16 = 0
+            => (sqe) {
+                sqe.ioprio = ioprio;
+            },
+        offset: libc::off_t = 0
+            => (sqe) {
+                sqe.__bindgen_anon_1.off = offset as _;
+            },
         /// specified for read operations, contains a bitwise OR of per-I/O flags,
         /// as described in the `preadv2(2)` man page.
         rw_flags: types::RwFlags = 0
+            => (sqe) {
+                sqe.__bindgen_anon_3.rw_flags = rw_flags;
+            }
     }
 
     pub const CODE = sys::IORING_OP_READV;
-
-    pub fn build(self) -> Entry {
-        let Readv {
-            fd,
-            iovec, len, offset,
-            ioprio, rw_flags
-        } = self;
-
-        let mut sqe = sqe_zeroed();
-        sqe.opcode = Self::CODE;
-        assign_fd!(sqe.fd = fd);
-        sqe.ioprio = ioprio;
-        sqe.__bindgen_anon_2.addr = iovec as _;
-        sqe.len = len;
-        sqe.__bindgen_anon_1.off = offset as _;
-        sqe.__bindgen_anon_3.rw_flags = rw_flags;
-        Entry(sqe)
-    }
 );
 
-opcode!(
+opcode2!(
     /// Vectored write, equivalent to `pwritev2(2)`.
-    #[derive(Debug)]
     pub struct Writev {
-        fd: { impl sealed::UseFixed },
-        iovec: { *const libc::iovec },
-        len: { u32 },
+        fd: { impl sealed::UseFixed }
+            => (sqe) {
+                assign_fd!(sqe.fd = fd.into());
+            },
+        iovec: { *const libc::iovec }
+            => (sqe) {
+                sqe.__bindgen_anon_2.addr = iovec as _;
+            },
+        len: { u32 }
+            => (sqe) {
+                sqe.len = len;
+            },
         ;;
-        ioprio: u16 = 0,
-        offset: libc::off_t = 0,
+        ioprio: u16 = 0
+            => (sqe) {
+                sqe.ioprio = ioprio;
+            },
+        offset: libc::off_t = 0
+            => (sqe) {
+                sqe.__bindgen_anon_1.off = offset as _;
+            },
         /// specified for write operations, contains a bitwise OR of per-I/O flags,
         /// as described in the `preadv2(2)` man page.
         rw_flags: types::RwFlags = 0
+            => (sqe) {
+                sqe.__bindgen_anon_3.rw_flags = rw_flags;
+            }
     }
 
     pub const CODE = sys::IORING_OP_WRITEV;
-
-    pub fn build(self) -> Entry {
-        let Writev {
-            fd,
-            iovec, len, offset,
-            ioprio, rw_flags
-        } = self;
-
-        let mut sqe = sqe_zeroed();
-        sqe.opcode = Self::CODE;
-        assign_fd!(sqe.fd = fd);
-        sqe.ioprio = ioprio;
-        sqe.__bindgen_anon_2.addr = iovec as _;
-        sqe.len = len;
-        sqe.__bindgen_anon_1.off = offset as _;
-        sqe.__bindgen_anon_3.rw_flags = rw_flags;
-        Entry(sqe)
-    }
 );
 
 opcode!(
