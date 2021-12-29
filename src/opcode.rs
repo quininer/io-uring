@@ -165,10 +165,9 @@ macro_rules! opcode2 {
             $(
                 $( #[$opt_meta] )*
                 #[inline]
-                pub fn $opt_field(mut self, $opt_field: $opt_tname) -> Self {
+                pub fn $opt_field(&mut self, $opt_field: $opt_tname) {
                     let $opt_sqe = &mut self.0;
                     $opt_block;
-                    self
                 }
             )*
 
